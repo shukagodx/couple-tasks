@@ -1,3 +1,4 @@
 .vapid-secret.env
 .supabase/
 supabase/.temp/
+_test/

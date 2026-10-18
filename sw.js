@@ -1,5 +1,5 @@
 // Минимальный service worker: сеть в приоритете, оболочка приложения доступна офлайн
-const CACHE = 'tasks-shell-v1';
+const CACHE = 'tasks-shell-v2';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'config.js', 'manifest.json'];
 
 self.addEventListener('install', (e) => {

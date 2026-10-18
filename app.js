@@ -1,14 +1,5 @@
 'use strict';
 
-const sb = supabase.createClient(APP_CONFIG.url, APP_CONFIG.anonKey);
-const root = document.getElementById('app');
-const sheetRoot = document.getElementById('sheet-root');
-
-const DOW = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
-const WINDOW_DAYS = 14;
-
-const state = { me: null, profiles: [], tasks: [], logs: [], tab: 'mine' };
-
 /* ---------- helpers ---------- */
 
 function h(tag, props, ...kids) {
@@ -20,7 +11,7 @@ function h(tag, props, ...kids) {
     else if (k === 'value') e.value = v;
     else e.setAttribute(k, v === true ? '' : v);
   }
-  for (const c of kids.flat()) {
+  for (const c of kids.flat(Infinity)) {
     if (c == null || c === false) continue;
     e.append(c.nodeType ? c : document.createTextNode(c));
   }
@@ -33,20 +24,80 @@ const parseYmd = (s) => { const [y, m, d] = s.split('-').map(Number); return new
 const addDays = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
 const isoDow = (d) => ((d.getDay() + 6) % 7) + 1; // Пн=1 .. Вс=7
 const hhmm = (t) => (t ? t.slice(0, 5) : '');
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+const ICONS = {
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+  img: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="M4 18l5-5 4 4 3-3 4 4"/></svg>',
+};
+const icon = (name) => { const s = document.createElement('span'); s.className = 'ico'; s.innerHTML = ICONS[name]; return s; };
+const brandMark = () => h('span', { class: 'mark' }, h('i', { class: 'a' }), h('i', { class: 'b' }));
+
+/* ---------- setup ---------- */
+
+const sb = supabase.createClient(APP_CONFIG.url, APP_CONFIG.anonKey);
+const root = document.getElementById('app');
+const screenRoot = document.getElementById('screen-root');
+const overlayRoot = document.getElementById('overlay-root');
+const lockRoot = document.getElementById('lock-root');
+
+const DOW = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+const WINDOW_DAYS = 14;
+const LOGIN_DOMAIN = 'couple-tasks.app';
+const NICK_RE = /^[a-z0-9._-]{2,30}$/i;
+const LOCK_AFTER_MS = 30000;
+
+const state = { me: null, profiles: [], tasks: [], logs: [], tab: 'mine', day: ymd(new Date()), unlocked: false, hiddenAt: 0 };
+const photoCache = new Map();
+
 const nameOf = (id) => (state.profiles.find((p) => p.id === id) || {}).name || '—';
 const partner = () => state.profiles.find((p) => p.id !== state.me.id);
+const personClass = (id) => (state.profiles.map((p) => p.id).sort().indexOf(id) === 0 ? 'a' : 'b');
+const avatar = (id, size) => h('span', { class: `av ${personClass(id)} ${size || ''}`, title: nameOf(id) }, (nameOf(id)[0] || '?').toUpperCase());
 
-function dayLabel(ds) {
+const loginToEmail = (v) => { v = v.trim().toLowerCase(); return v.includes('@') ? v : `${v}@${LOGIN_DOMAIN}`; };
+const emailToLogin = (e) => (e && e.endsWith('@' + LOGIN_DOMAIN) ? e.slice(0, -(LOGIN_DOMAIN.length + 1)) : e || '');
+
+function dayTitle(ds) {
   const today = ymd(new Date());
   if (ds === today) return 'Сегодня';
   if (ds === ymd(addDays(new Date(), 1))) return 'Завтра';
-  const d = parseYmd(ds);
-  return `${DOW[isoDow(d) - 1]}, ${d.getDate()}.${pad(d.getMonth() + 1)}`;
+  return cap(parseYmd(ds).toLocaleDateString('ru-RU', { weekday: 'long' }));
+}
+const fullDate = (ds) => parseYmd(ds).toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' });
+const daysLabel = (days) => (days.length === 7 ? 'каждый день' : days.slice().sort().map((n) => DOW[n - 1]).join(' '));
+
+function authError(err) {
+  const m = (err && err.message) || '';
+  if (/invalid login/i.test(m)) return 'Неверный ник или пароль';
+  if (/already registered|already been registered/i.test(m)) return 'Этот ник уже занят';
+  if (/at least/i.test(m)) return 'Пароль: минимум 6 символов';
+  if (/rate limit/i.test(m)) return 'Слишком много попыток, подожди минуту';
+  if (/signups? (are )?disabled|not allowed/i.test(m)) return 'Регистрация закрыта';
+  return m || 'Ошибка';
 }
 
-function daysLabel(days) {
-  if (days.length === 7) return 'каждый день';
-  return days.slice().sort().map((n) => DOW[n - 1]).join(' ');
+/* ---------- screens (full-screen layer with back button) ---------- */
+
+let screenOpen = false;
+function openScreen(el) {
+  screenRoot.replaceChildren(el);
+  if (!screenOpen) { history.pushState({ screen: 1 }, ''); screenOpen = true; }
+}
+function clearScreen() { screenRoot.replaceChildren(); screenOpen = false; }
+function closeScreen() { if (screenOpen) history.back(); }
+window.addEventListener('popstate', clearScreen);
+
+function frame({ right, body, foot }) {
+  return h('div', { class: 'screen' },
+    h('div', { class: 'screen-bar' },
+      h('button', { class: 'back', onclick: closeScreen, 'aria-label': 'Назад' }, icon('back'), 'Назад'),
+      right || null),
+    h('div', { class: 'screen-body' }, h('div', { class: 'in' }, body)),
+    foot ? h('div', { class: 'screen-foot' }, h('div', { class: 'in' }, foot)) : null);
 }
 
 /* ---------- data ---------- */
@@ -63,7 +114,6 @@ async function loadAll() {
 }
 
 function buildItems() {
-  const today = ymd(new Date());
   const mine = state.tab === 'mine';
   const items = [];
   for (const task of state.tasks) {
@@ -74,146 +124,291 @@ function buildItems() {
     } else {
       for (let i = 0; i < WINDOW_DAYS; i++) {
         const d = addDays(new Date(), i);
-        const ds = ymd(d);
-        if (ds >= task.due_date && task.days.includes(isoDow(d))) dates.push(ds);
+        if (ymd(d) >= task.due_date && task.days.includes(isoDow(d))) dates.push(ymd(d));
       }
     }
     for (const date of dates) {
-      const log = state.logs.find((l) => l.task_id === task.id && l.date === date);
-      items.push({ task, date, log });
+      items.push({ task, date, log: state.logs.find((l) => l.task_id === task.id && l.date === date) });
     }
   }
   items.sort((a, b) => a.date.localeCompare(b.date) || (a.task.due_time || '99').localeCompare(b.task.due_time || '99'));
-  return { items, today };
+  return items;
 }
 
 /* ---------- auth ---------- */
 
-function renderAuth(msg) {
-  sheetRoot.replaceChildren();
-  const email = h('input', { type: 'email', placeholder: 'Почта', autocomplete: 'email' });
-  const pass = h('input', { type: 'password', placeholder: 'Пароль (минимум 6 символов)', autocomplete: 'current-password' });
-  const err = h('div', { class: 'err' }, msg || '');
-  const go = async (signup) => {
-    err.textContent = '';
-    const creds = { email: email.value.trim(), password: pass.value };
-    const { error } = signup ? await sb.auth.signUp(creds) : await sb.auth.signInWithPassword(creds);
-    if (error) { err.textContent = error.message; return; }
-    boot();
+function renderAuth(mode = 'login', msg = '') {
+  lockRoot.replaceChildren();
+  clearScreen();
+  const signup = mode === 'signup';
+  const nick = h('input', { type: 'text', name: 'username', autocomplete: 'username', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', placeholder: 'Ник латиницей', enterkeyhint: 'next' });
+  const pass = h('input', { type: 'password', name: 'password', autocomplete: signup ? 'new-password' : 'current-password', placeholder: 'Пароль', enterkeyhint: 'go' });
+  const peek = h('button', {
+    type: 'button', class: 'peek',
+    onclick: () => { const show = pass.type === 'password'; pass.type = show ? 'text' : 'password'; peek.textContent = show ? 'Скрыть' : 'Показать'; },
+  }, 'Показать');
+  const err = h('div', { class: 'err', role: 'alert' }, msg);
+  const submit = h('button', { type: 'submit', class: 'btn primary' }, signup ? 'Создать аккаунт' : 'Войти');
+
+  const form = h('form', {
+    onsubmit: async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      const login = nick.value.trim();
+      if (!login || !pass.value) { err.textContent = 'Введи ник и пароль'; return; }
+      if (!login.includes('@') && !NICK_RE.test(login)) { err.textContent = 'Ник: латиница, цифры, точка, дефис или _'; return; }
+      submit.disabled = true;
+      const creds = { email: loginToEmail(login), password: pass.value };
+      const { error } = signup ? await sb.auth.signUp(creds) : await sb.auth.signInWithPassword(creds);
+      submit.disabled = false;
+      if (error) { err.textContent = authError(error); return; }
+      state.unlocked = true;
+      boot();
+    },
+  },
+    h('div', { class: 'field' }, nick),
+    h('div', { class: 'field' }, pass, peek),
+    submit,
+    err);
+
+  root.replaceChildren(h('div', { class: 'auth' },
+    brandMark(),
+    h('h1', {}, 'Задания'),
+    h('p', { class: 'lead' }, signup ? 'Придумай ник и пароль' : 'Для двоих'),
+    form,
+    h('button', { class: 'link', onclick: () => renderAuth(signup ? 'login' : 'signup') }, signup ? 'Уже есть аккаунт? Войти' : 'Нет аккаунта? Создать')));
+}
+
+function askName() {
+  const input = h('input', { type: 'text', name: 'name', autocomplete: 'off', placeholder: 'Твоё имя', value: cap(emailToLogin(state.me.email).split('@')[0]) });
+  const err = h('div', { class: 'err' });
+  root.replaceChildren(h('div', { class: 'auth' },
+    brandMark(),
+    h('h1', {}, 'Как тебя зовут?'),
+    h('p', { class: 'lead' }, 'Имя увидит вторая половинка'),
+    h('form', {
+      onsubmit: async (e) => {
+        e.preventDefault();
+        const name = input.value.trim();
+        if (!name) return;
+        const { error } = await sb.from('profiles').insert({ id: state.me.id, name });
+        if (error) { err.textContent = error.message; return; }
+        boot();
+      },
+    }, h('div', { class: 'field' }, input), h('button', { type: 'submit', class: 'btn primary' }, 'Продолжить'), err)));
+}
+
+/* ---------- Face ID lock (WebAuthn, на этом устройстве) ---------- */
+
+const b64u = {
+  enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''),
+  dec: (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0)),
+};
+const lockSupported = () => !!(window.PublicKeyCredential && navigator.credentials);
+const lockKey = () => 'lockCred:' + state.me.id;
+const lockEnabled = () => { try { return !!localStorage.getItem(lockKey()); } catch (_) { return false; } };
+
+async function enableLock() {
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: 'Задания', id: location.hostname },
+      user: { id: new TextEncoder().encode(state.me.id), name: emailToLogin(state.me.email), displayName: nameOf(state.me.id) },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' },
+      timeout: 60000,
+      attestation: 'none',
+    },
+  });
+  localStorage.setItem(lockKey(), b64u.enc(cred.rawId));
+}
+
+async function verifyLock() {
+  await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials: [{ type: 'public-key', id: b64u.dec(localStorage.getItem(lockKey())) }],
+      userVerification: 'required',
+      rpId: location.hostname,
+      timeout: 60000,
+    },
+  });
+}
+
+function showLock() {
+  state.unlocked = false;
+  const msg = h('div', { class: 'err' });
+  const attempt = async (manual) => {
+    try {
+      await verifyLock();
+      state.unlocked = true;
+      lockRoot.replaceChildren();
+    } catch (_) {
+      if (manual) msg.textContent = 'Не получилось подтвердить. Попробуй ещё раз.';
+    }
   };
-  root.replaceChildren(
-    h('div', { class: 'auth' },
-      h('h1', {}, 'Задания'),
-      h('div', { class: 'field' }, email),
-      h('div', { class: 'field' }, pass),
-      h('button', { class: 'btn primary', onclick: () => go(false) }, 'Войти'),
-      h('button', { class: 'btn', onclick: () => go(true) }, 'Создать аккаунт'),
-      err
-    )
+  lockRoot.replaceChildren(h('div', { class: 'lock' },
+    brandMark(),
+    h('h1', {}, 'Задания'),
+    h('p', { class: 'lead' }, 'Подтверди вход с Face ID'),
+    h('button', { class: 'btn primary', onclick: () => attempt(true) }, 'Разблокировать'),
+    h('button', { class: 'link', onclick: async () => { lockRoot.replaceChildren(); await sb.auth.signOut(); boot(); } }, 'Войти с паролем'),
+    msg));
+  attempt(false);
+}
+
+/* ---------- push ---------- */
+
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const pushOn = () => pushSupported() && Notification.permission === 'granted';
+
+function urlB64ToUint8(b64) {
+  const s = (b64 + '='.repeat((4 - (b64.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+}
+
+async function syncPush(askPermission) {
+  if (!pushSupported()) return;
+  if (Notification.permission !== 'granted') {
+    if (!askPermission) return;
+    if ((await Notification.requestPermission()) !== 'granted') return;
+  }
+  const reg = await navigator.serviceWorker.ready;
+  const sub = (await reg.pushManager.getSubscription()) ||
+    (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(APP_CONFIG.vapidPublicKey) }));
+  const j = sub.toJSON();
+  await sb.from('push_subscriptions').upsert(
+    { user_id: state.me.id, endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth },
+    { onConflict: 'endpoint' }
   );
 }
 
-async function askName() {
-  const input = h('input', { type: 'text', placeholder: 'Как тебя зовут?' });
-  const err = h('div', { class: 'err' });
-  root.replaceChildren(
-    h('div', { class: 'auth' },
-      h('h1', {}, 'Привет'),
-      h('div', { class: 'field' }, input),
-      h('button', {
-        class: 'btn primary',
-        onclick: async () => {
-          const name = input.value.trim();
-          if (!name) return;
-          const { error } = await sb.from('profiles').insert({ id: state.me.id, name });
-          if (error) { err.textContent = error.message; return; }
-          boot();
-        },
-      }, 'Продолжить'),
-      err
-    )
-  );
+function pushNotice() {
+  if (pushOn()) return null;
+  if (pushSupported()) {
+    return h('div', { class: 'notice' }, 'Включи уведомления, чтобы не пропустить задание',
+      h('button', { onclick: async () => { try { await syncPush(true); } catch (_) {} render(); } }, 'Включить'));
+  }
+  return h('div', { class: 'notice' }, 'Для уведомлений: Поделиться → «На экран Домой», затем открой приложение с иконки.');
+}
+
+/* ---------- menu ---------- */
+
+function openMenu() {
+  const close = () => overlayRoot.replaceChildren();
+  const build = () => {
+    const rows = [];
+    if (lockSupported()) {
+      rows.push(h('div', { class: 'menu-row' },
+        h('div', {}, 'Вход по Face ID', h('small', {}, lockEnabled() ? 'Включён на этом телефоне' : 'Спрашивать при открытии')),
+        h('button', {
+          onclick: async () => {
+            if (lockEnabled()) { localStorage.removeItem(lockKey()); }
+            else {
+              try { await enableLock(); state.unlocked = true; }
+              catch (_) { alert('Не удалось включить Face ID на этом устройстве'); }
+            }
+            build();
+          },
+        }, lockEnabled() ? 'Выключить' : 'Включить')));
+    }
+    rows.push(h('div', { class: 'menu-row' },
+      h('div', {}, 'Уведомления', h('small', {}, pushOn() ? 'Включены' : pushSupported() ? 'Выключены' : 'Нужен экран «Домой»')),
+      pushSupported() && !pushOn() ? h('button', { onclick: async () => { try { await syncPush(true); } catch (_) {} build(); render(); } }, 'Включить') : null));
+    rows.push(h('div', { class: 'menu-row' },
+      h('div', {}, 'Аккаунт'),
+      h('button', { class: 'danger', onclick: async () => { close(); await sb.auth.signOut(); state.unlocked = false; boot(); } }, 'Выйти')));
+    const sheet = h('div', { class: 'menu' },
+      h('div', { class: 'who' }, avatar(state.me.id), h('div', {}, h('b', {}, nameOf(state.me.id)), h('span', { class: 'muted' }, emailToLogin(state.me.email)))),
+      rows);
+    overlayRoot.replaceChildren(h('div', { class: 'backdrop', onclick: (e) => { if (e.target === e.currentTarget) close(); } }, sheet));
+  };
+  build();
 }
 
 /* ---------- main view ---------- */
 
 function render() {
-  const { items, today } = buildItems();
-  const over = items.filter((i) => i.date < today && !i.log);
-  const upcoming = items.filter((i) => i.date >= today);
-  const archive = items.filter((i) => i.date < today && i.log).reverse();
-
-  const groups = [];
-  if (over.length) groups.push({ title: 'Просрочено', cls: 'over', list: over });
-  const byDate = new Map();
-  for (const i of upcoming) {
-    if (!byDate.has(i.date)) byDate.set(i.date, []);
-    byDate.get(i.date).push(i);
-  }
-  for (const [date, list] of byDate) groups.push({ title: dayLabel(date), list });
-
+  const today = ymd(new Date());
+  if (state.day < today) state.day = today;
+  const items = buildItems();
   const p = partner();
-  const body = [];
+  const isToday = state.day === today;
+
+  const dayItems = items.filter((i) => i.date === state.day);
+  const over = isToday ? items.filter((i) => i.date < today && !i.log) : [];
+  const archive = isToday ? items.filter((i) => i.date < today && i.log).reverse() : [];
+  const done = dayItems.filter((i) => i.log && i.log.status === 'done').length;
+
+  const prevStrip = root.querySelector('.strip');
+  const stripScroll = prevStrip ? prevStrip.scrollLeft : 0;
+  const pageY = window.scrollY;
+
+  const days = [];
+  for (let i = 0; i < WINDOW_DAYS; i++) {
+    const ds = ymd(addDays(new Date(), i));
+    const its = items.filter((x) => x.date === ds);
+    const open = its.some((x) => !x.log);
+    const d = parseYmd(ds);
+    days.push(h('button', {
+      class: 'day' + (ds === state.day ? ' on' : '') + (ds === today ? ' today' : ''),
+      onclick: () => { state.day = ds; render(); },
+    },
+      h('span', { class: 'wd' }, DOW[isoDow(d) - 1]),
+      h('span', { class: 'num' }, d.getDate()),
+      h('span', { class: 'dot-ind ' + (its.length ? (open ? 'todo' : 'finished') : '') })));
+  }
+
+  const rows = [];
   if (!p) {
-    body.push(h('div', { class: 'empty' }, 'Ждём вторую половинку.\nПусть создаст аккаунт в приложении.'));
-  } else if (!groups.length && !archive.length) {
-    body.push(h('div', { class: 'empty' }, state.tab === 'mine' ? 'Заданий нет' : 'Ты пока ничего не поставил(а)'));
+    rows.push(h('div', { class: 'empty' }, h('b', {}, 'Ждём вторую половинку'), 'Пусть создаст аккаунт в приложении'));
+  } else if (!dayItems.length && !over.length) {
+    rows.push(h('div', { class: 'empty' }, brandMark(),
+      h('b', {}, 'На этот день заданий нет'),
+      state.tab === 'sent' ? 'Нажми «Новое задание», чтобы поставить' : 'Можно отдохнуть'));
   }
-  for (const g of groups) {
-    body.push(h('div', { class: 'group ' + (g.cls || '') }, h('h2', {}, g.title), g.list.map(itemRow)));
-  }
-  if (archive.length) {
-    body.push(h('details', { class: 'archive' }, h('summary', {}, `Архив (${archive.length})`), archive.map(itemRow)));
-  }
+  if (over.length) rows.push(h('div', { class: 'group-title over' }, 'Просрочено'), over.map(itemRow));
+  if (over.length && dayItems.length) rows.push(h('div', { class: 'group-title' }, 'На сегодня'));
+  rows.push(dayItems.map(itemRow));
+  if (archive.length) rows.push(h('details', { class: 'archive' }, h('summary', {}, `Архив (${archive.length})`), archive.map(itemRow)));
 
   const tab = (key, label) => h('button', { class: state.tab === key ? 'on' : '', onclick: () => { state.tab = key; render(); } }, label);
-  const sentLabel = p ? `Для ${p.name}` : 'От меня';
 
   root.replaceChildren(
-    h('div', { class: 'wrap' },
-      h('div', { class: 'top' },
-        h('h1', {}, 'Задания'),
-        h('button', { class: 'link', onclick: async () => { await sb.auth.signOut(); boot(); } }, `${nameOf(state.me.id)} · выйти`)
-      ),
-      pushBanner(),
-      h('div', { class: 'tabs' }, tab('mine', 'Мне'), tab('sent', sentLabel)),
-      body
-    ),
-    p ? h('button', { class: 'fab', 'aria-label': 'Новое задание', onclick: openNewTask }, '+') : null
-  );
+    h('div', { class: 'hero' },
+      h('div', { class: 'topbar' }, brandMark(),
+        h('button', { class: 'avatar-btn', onclick: openMenu, 'aria-label': 'Меню' }, avatar(state.me.id))),
+      h('div', { class: 'tabs' }, tab('mine', 'Мне'), tab('sent', p ? `Для ${p.name}` : 'От меня')),
+      h('h1', { class: 'daytitle' }, dayTitle(state.day)),
+      h('div', { class: 'daydate' }, fullDate(state.day)),
+      h('div', { class: 'progress' }, dayItems.map((i) => h('i', { class: i.log ? i.log.status : '' }))),
+      h('div', { class: 'progress-note' }, dayItems.length ? `Выполнено ${done} из ${dayItems.length}` : 'Заданий нет'),
+      h('div', { class: 'strip' }, days)),
+    h('div', { class: 'panel' }, h('div', { class: 'panel-in' }, pushNotice(), rows)),
+    p ? h('button', { class: 'fab', onclick: openNewTask }, icon('plus'), 'Новое задание') : null);
+
+  const strip = root.querySelector('.strip');
+  if (strip) strip.scrollLeft = stripScroll;
+  window.scrollTo(0, pageY);
 }
 
 function itemRow(item) {
-  const { task, date, log } = item;
-  const bits = [];
-  if (task.due_time) bits.push(hhmm(task.due_time));
-  if (task.days.length) bits.push(daysLabel(task.days));
-  if (task.photo_path) bits.push('фото');
-  if (state.tab === 'sent' || task.created_by !== state.me.id) bits.push(state.tab === 'sent' ? `для ${nameOf(task.assigned_to)}` : `от ${nameOf(task.created_by)}`);
-  const mark = log ? (log.status === 'done' ? '✓' : '✕') : '';
+  const { task, log } = item;
+  const mine = state.tab === 'mine';
+  const sub = [];
+  if (task.days.length) sub.push(daysLabel(task.days));
+  if (task.photo_path) sub.push('фото');
+  const mark = log ? icon(log.status === 'done' ? 'check' : 'x') : null;
   return h('div', { class: 'item' + (log ? ' finished' : ''), onclick: () => openDetail(item) },
+    h('div', { class: 'time' }, hhmm(task.due_time) || ''),
     h('div', { class: 'dot ' + (log ? log.status : '') }, mark),
     h('div', { class: 'main' },
       h('div', { class: 'title' }, task.title),
-      bits.length ? h('div', { class: 'sub' }, bits.join(' · ')) : null
-    )
-  );
+      sub.length ? h('div', { class: 'sub' }, sub.join(', ')) : null),
+    avatar(mine ? task.created_by : task.assigned_to, 'sm'));
 }
 
-/* ---------- sheet ---------- */
-
-function closeSheet() { sheetRoot.replaceChildren(); }
-
-function openSheet(...content) {
-  const overlay = h('div', { class: 'overlay', onclick: (e) => { if (e.target === overlay) closeSheet(); } },
-    h('div', { class: 'sheet' }, content));
-  sheetRoot.replaceChildren(overlay);
-}
-
-async function signedUrl(path) {
-  const { data } = await sb.storage.from('photos').createSignedUrl(path, 3600);
-  return data && data.signedUrl;
-}
+/* ---------- task details ---------- */
 
 async function openDetail(item) {
   const { task, date } = item;
@@ -221,33 +416,46 @@ async function openDetail(item) {
   const isCreator = task.created_by === state.me.id;
   const current = () => state.logs.find((l) => l.task_id === task.id && l.date === date);
 
-  const meta = [dayLabel(date)];
-  if (task.due_time) meta.push(hhmm(task.due_time));
-  if (task.days.length) meta.push(daysLabel(task.days));
-  meta.push(`от ${nameOf(task.created_by)}`);
-
   const photoSlot = h('div');
   const commentsBox = h('div');
-  const input = h('input', { type: 'text', placeholder: 'Комментарий' });
+  const input = h('input', { type: 'text', placeholder: 'Написать комментарий', enterkeyhint: 'send' });
+  let screenEl;
 
-  const setStatus = async (status) => {
+  const setStatus = (status) => {
     const existing = current();
-    if (existing && existing.status === status) {
-      await sb.from('task_logs').delete().eq('id', existing.id);
-    } else {
-      await sb.from('task_logs').upsert({ task_id: task.id, date, status, by: state.me.id }, { onConflict: 'task_id,date' });
-    }
-    await loadAll();
+    const toggledOff = !!existing && existing.status === status;
+    if (toggledOff) state.logs = state.logs.filter((l) => l !== existing);
+    else if (existing) existing.status = status;
+    else state.logs.push({ id: 'tmp-' + Date.now(), task_id: task.id, date, status, by: state.me.id });
     render();
-    openDetail(item);
+    if (!toggledOff) {
+      screenEl.append(h('div', { class: 'pop' }, h('div', { class: 'ball ' + status }, icon(status === 'done' ? 'check' : 'x'))));
+    }
+    setTimeout(closeScreen, toggledOff ? 80 : 650);
+    const req = toggledOff
+      ? sb.from('task_logs').delete().eq('task_id', task.id).eq('date', date)
+      : sb.from('task_logs').upsert({ task_id: task.id, date, status, by: state.me.id }, { onConflict: 'task_id,date' });
+    req.then(({ error }) => {
+      if (error) alert('Не удалось сохранить: ' + error.message);
+      return loadAll().then(render);
+    });
   };
 
   const st = current();
-  const statusRow = isAssignee
+  const foot = isAssignee
     ? h('div', { class: 'row' },
-        h('button', { class: 'btn ok' + (st && st.status === 'done' ? ' on' : ''), onclick: () => setStatus('done') }, 'Выполнено'),
-        h('button', { class: 'btn bad' + (st && st.status === 'failed' ? ' on' : ''), onclick: () => setStatus('failed') }, 'Не выполнено'))
-    : st ? h('div', { class: 'meta' }, st.status === 'done' ? '✓ Выполнено' : '✕ Не выполнено') : null;
+        h('button', { class: 'btn ok' + (st && st.status === 'done' ? ' on' : ''), onclick: () => setStatus('done') }, icon('check'), 'Выполнено'),
+        h('button', { class: 'btn bad' + (st && st.status === 'failed' ? ' on' : ''), onclick: () => setStatus('failed') }, icon('x'), 'Не выполнено'))
+    : st ? h('div', { class: 'chips-row' }, h('span', { class: 'chip' }, st.status === 'done' ? 'Выполнено' : 'Не выполнено')) : null;
+
+  async function loadComments() {
+    const { data } = await sb.from('comments').select('*').eq('task_id', task.id).order('created_at');
+    commentsBox.replaceChildren(...(data || []).map((c) =>
+      h('div', { class: 'comment' }, avatar(c.author, 'sm'),
+        h('div', { class: 'bubble' },
+          h('div', { class: 'who' }, `${nameOf(c.author)}, ${new Date(c.created_at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`),
+          h('div', { class: 'body' }, c.body)))));
+  }
 
   const sendComment = async () => {
     const body = input.value.trim();
@@ -256,41 +464,50 @@ async function openDetail(item) {
     await sb.from('comments').insert({ task_id: task.id, author: state.me.id, body });
     loadComments();
   };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendComment(); });
 
-  async function loadComments() {
-    const { data } = await sb.from('comments').select('*').eq('task_id', task.id).order('created_at');
-    commentsBox.replaceChildren(...(data || []).map((c) =>
-      h('div', { class: 'comment' },
-        h('div', { class: 'who' }, `${nameOf(c.author)} · ${new Date(c.created_at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`),
-        h('div', { class: 'body' }, c.body))));
-  }
+  const chips = [h('span', { class: 'chip' }, dayTitle(date))];
+  if (task.due_time) chips.push(h('span', { class: 'chip' }, hhmm(task.due_time)));
+  if (task.days.length) chips.push(h('span', { class: 'chip' }, daysLabel(task.days)));
+  chips.push(h('span', { class: 'chip' }, avatar(task.created_by, 'sm'), `от ${nameOf(task.created_by)}`));
 
-  openSheet(
-    h('h3', {}, task.title),
-    h('div', { class: 'meta' }, meta.join(' · ')),
-    task.note ? h('div', { class: 'note' }, task.note) : null,
-    photoSlot,
-    statusRow,
-    h('div', { class: 'sec' }, 'Комментарии'),
-    commentsBox,
-    h('div', { class: 'send' }, input, h('button', { class: 'btn', onclick: sendComment }, '→')),
-    isCreator ? h('button', {
-      class: 'btn danger', style: 'width:100%;margin-top:24px',
-      onclick: async () => {
-        if (!confirm('Удалить задание?')) return;
-        if (task.photo_path) await sb.storage.from('photos').remove([task.photo_path]);
-        await sb.from('tasks').delete().eq('id', task.id);
-        closeSheet();
-        await loadAll();
-        render();
-      },
-    }, 'Удалить задание') : null
-  );
+  const del = isCreator ? h('button', {
+    class: 'text-btn danger',
+    onclick: async () => {
+      if (!confirm('Удалить задание?')) return;
+      state.tasks = state.tasks.filter((t) => t.id !== task.id);
+      state.logs = state.logs.filter((l) => l.task_id !== task.id);
+      render();
+      closeScreen();
+      if (task.photo_path) sb.storage.from('photos').remove([task.photo_path]);
+      sb.from('tasks').delete().eq('id', task.id).then(() => loadAll().then(render));
+    },
+  }, 'Удалить') : null;
 
+  screenEl = frame({
+    right: del,
+    body: [
+      h('h2', {}, task.title),
+      h('div', { class: 'chips-row' }, chips),
+      task.note ? h('div', { class: 'note' }, task.note) : null,
+      photoSlot,
+      h('div', { class: 'sec' }, 'Комментарии'),
+      commentsBox,
+      h('div', { class: 'send' }, input, h('button', { onclick: sendComment, 'aria-label': 'Отправить' }, '↑')),
+    ],
+    foot,
+  });
+  openScreen(screenEl);
   loadComments();
+
   if (task.photo_path) {
-    const url = await signedUrl(task.photo_path);
-    if (url) photoSlot.replaceChildren(h('img', { class: 'photo', src: url, alt: '' }));
+    let url = photoCache.get(task.photo_path);
+    if (!url) {
+      const { data } = await sb.storage.from('photos').createSignedUrl(task.photo_path, 3600);
+      url = data && data.signedUrl;
+      if (url) photoCache.set(task.photo_path, url);
+    }
+    if (url) photoSlot.replaceChildren(h('img', { class: 'photo', src: url, alt: 'Фото к заданию' }));
   }
 }
 
@@ -318,14 +535,14 @@ function openNewTask() {
   const p = partner();
   const form = { recurring: false, days: new Set(), blob: null };
 
-  const title = h('input', { type: 'text', placeholder: 'Что нужно сделать?' });
-  const note = h('textarea', { placeholder: 'Подробности (необязательно)' });
-  const date = h('input', { type: 'date', value: ymd(new Date()) });
+  const title = h('input', { type: 'text', class: 'big', placeholder: 'Что нужно сделать?', enterkeyhint: 'next' });
+  const note = h('textarea', { placeholder: 'Подробности, если нужно' });
+  const date = h('input', { type: 'date', value: state.day });
   const time = h('input', { type: 'time' });
-  const err = h('div', { class: 'err' });
+  const err = h('div', { class: 'err', role: 'alert' });
   const dateLabel = h('label', {}, 'Дата');
   const daysField = h('div', { class: 'field', style: 'display:none' }, h('label', {}, 'Дни недели'));
-  const chips = h('div', { class: 'chips' }, DOW.map((name, i) =>
+  daysField.append(h('div', { class: 'chips' }, DOW.map((name, i) =>
     h('button', {
       type: 'button',
       onclick: (e) => {
@@ -333,8 +550,7 @@ function openNewTask() {
         form.days.has(n) ? form.days.delete(n) : form.days.add(n);
         e.currentTarget.classList.toggle('on', form.days.has(n));
       },
-    }, name)));
-  daysField.append(chips);
+    }, name))));
 
   const once = h('button', { class: 'on', type: 'button' }, 'Один раз');
   const weekly = h('button', { type: 'button' }, 'По дням недели');
@@ -356,12 +572,12 @@ function openNewTask() {
     try {
       form.blob = await compressImage(f);
       preview.replaceChildren(h('img', { class: 'preview', src: URL.createObjectURL(form.blob), alt: '' }));
-    } catch (e) {
+    } catch (_) {
       err.textContent = 'Не удалось прочитать фото';
     }
   });
 
-  const save = h('button', { class: 'btn primary', style: 'width:100%;margin-top:6px' }, 'Поставить задание');
+  const save = h('button', { class: 'btn primary' }, 'Поставить задание');
   save.onclick = async () => {
     err.textContent = '';
     if (!title.value.trim()) { err.textContent = 'Напиши, что нужно сделать'; return; }
@@ -387,8 +603,9 @@ function openNewTask() {
         days: form.recurring ? [...form.days].sort() : [],
       });
       if (error) throw error;
-      closeSheet();
       state.tab = 'sent';
+      state.day = !form.recurring && date.value >= ymd(new Date()) ? date.value : ymd(new Date());
+      closeScreen();
       await loadAll();
       render();
     } catch (e) {
@@ -398,60 +615,19 @@ function openNewTask() {
     }
   };
 
-  openSheet(
-    h('h3', {}, `Задание для ${p.name}`),
-    h('div', { class: 'meta' }, ''),
-    h('div', { class: 'field' }, title),
-    h('div', { class: 'field' }, note),
-    h('div', { class: 'field' }, h('div', { class: 'seg' }, once, weekly)),
-    daysField,
-    h('div', { class: 'row field' },
-      h('div', {}, dateLabel, date),
-      h('div', {}, h('label', {}, 'Время'), time)),
-    h('div', { class: 'field' },
-      h('label', { class: 'filebtn' }, 'Прикрепить фото или скриншот', file),
-      preview),
-    save,
-    err
-  );
-}
-
-/* ---------- push ---------- */
-
-const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
-
-function urlB64ToUint8(b64) {
-  const s = (b64 + '='.repeat((4 - (b64.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/');
-  const raw = atob(s);
-  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
-}
-
-async function syncPush(askPermission) {
-  if (!pushSupported()) return;
-  if (Notification.permission !== 'granted') {
-    if (!askPermission) return;
-    if ((await Notification.requestPermission()) !== 'granted') return;
-  }
-  const reg = await navigator.serviceWorker.ready;
-  const sub = (await reg.pushManager.getSubscription()) ||
-    (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(APP_CONFIG.vapidPublicKey) }));
-  const j = sub.toJSON();
-  await sb.from('push_subscriptions').upsert(
-    { user_id: state.me.id, endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth },
-    { onConflict: 'endpoint' }
-  );
-}
-
-function pushBanner() {
-  if (pushSupported()) {
-    if (Notification.permission === 'granted') return null;
-    return h('button', {
-      class: 'link', style: 'display:block;margin:4px 0',
-      onclick: async () => { await syncPush(true); render(); },
-    }, 'Включить уведомления');
-  }
-  return h('div', { class: 'sub', style: 'color:var(--muted);font-size:13px;margin:4px 0' },
-    'Для уведомлений: Поделиться → «На экран Домой», затем открой приложение с иконки.');
+  openScreen(frame({
+    body: [
+      h('h2', {}, `Задание для ${p.name}`),
+      h('div', { class: 'field' }, title),
+      h('div', { class: 'field' }, note),
+      h('div', { class: 'field' }, h('div', { class: 'seg' }, once, weekly)),
+      daysField,
+      h('div', { class: 'row field' }, h('div', {}, dateLabel, date), h('div', {}, h('label', {}, 'Время'), time)),
+      h('div', { class: 'field' }, h('label', { class: 'filebtn' }, icon('img'), 'Прикрепить фото или скриншот', file), preview),
+      err,
+    ],
+    foot: save,
+  }));
 }
 
 /* ---------- boot ---------- */
@@ -466,7 +642,7 @@ function subscribe() {
       reloadTimer = setTimeout(async () => {
         if (!state.me) return;
         await loadAll();
-        if (!sheetRoot.firstChild) render();
+        render();
       }, 300);
     })
     .subscribe();
@@ -481,6 +657,7 @@ async function boot() {
     return renderAuth();
   }
   state.me = session.user;
+  if (lockEnabled() && !state.unlocked) showLock();
   await loadAll();
   if (!state.profiles.some((p) => p.id === state.me.id)) return askName();
   render();
@@ -489,10 +666,11 @@ async function boot() {
 }
 
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && state.me) {
-    await loadAll();
-    if (!sheetRoot.firstChild) render();
-  }
+  if (document.visibilityState === 'hidden') { state.hiddenAt = Date.now(); return; }
+  if (!state.me) return;
+  if (lockEnabled() && state.hiddenAt && Date.now() - state.hiddenAt > LOCK_AFTER_MS) showLock();
+  await loadAll();
+  render();
 });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
